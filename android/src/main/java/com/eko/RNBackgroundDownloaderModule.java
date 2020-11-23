@@ -1,6 +1,7 @@
 package com.eko;
 
 import android.annotation.SuppressLint;
+import android.os.AsyncTask;
 import android.util.Log;
 
 import com.facebook.react.bridge.Arguments;
@@ -27,8 +28,10 @@ import com.tonyodev.fetch2core.Func;
 
 import org.jetbrains.annotations.NotNull;
 
+import java.io.BufferedInputStream;
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FileNotFoundException;
 import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.ObjectInputStream;
@@ -37,6 +40,8 @@ import java.util.Date;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipInputStream;
 
 import javax.annotation.Nullable;
 
@@ -72,7 +77,7 @@ public class RNBackgroundDownloaderModule extends ReactContextBaseJavaModule imp
   private DeviceEventManagerModule.RCTDeviceEventEmitter ee;
   private Date lastProgressReport = new Date();
   private HashMap<String, WritableMap> progressReports = new HashMap<>();
-  private static Object sharedLock = new Object(); 
+  private static Object sharedLock = new Object();
 
   public RNBackgroundDownloaderModule(ReactApplicationContext reactContext) {
     super(reactContext);
@@ -164,7 +169,7 @@ public class RNBackgroundDownloaderModule extends ReactContextBaseJavaModule imp
       e.printStackTrace();
     }
   }
-  
+
   private int convertErrorCode(Error error) {
     if ((error == Error.FILE_NOT_CREATED)
     || (error == Error.WRITE_PERMISSION_DENIED)) {
@@ -205,7 +210,7 @@ public class RNBackgroundDownloaderModule extends ReactContextBaseJavaModule imp
     }
     request.setPriority(options.hasKey("priority") ? Priority.valueOf(options.getInt("priority")) : Priority.NORMAL);
     request.setNetworkType(options.hasKey("network") ? NetworkType.valueOf(options.getInt("network")) : NetworkType.ALL);
-    
+
     fetch.enqueue(request, new Func<Request>() {
         @Override
         public void call(Request download) {
@@ -214,7 +219,7 @@ public class RNBackgroundDownloaderModule extends ReactContextBaseJavaModule imp
         @Override
         public void call(Error error) {
           //An error occurred when enqueuing a request.
-          
+
           WritableMap params = Arguments.createMap();
           params.putString("id", id);
           params.putString("error", error.toString());
@@ -307,9 +312,49 @@ public class RNBackgroundDownloaderModule extends ReactContextBaseJavaModule imp
     synchronized(sharedLock) {
       RNBGDTaskConfig config = requestIdToConfig.get(download.getId());
       if (config != null) {
-        WritableMap params = Arguments.createMap();
-        params.putString("id", config.id);
-        ee.emit("downloadComplete", params);
+        final String filePath = download.getFile();
+        final String taskId = config.id;
+        Log.d(getName(), "success callback!");
+
+        new Thread(new Runnable() {
+          @Override
+          public void run() {
+            try {
+              File downloadedZipFile = new File(filePath);
+              Log.d(getName(), "About to unzip: " + filePath + " (" + downloadedZipFile.exists() + ")");
+
+              File tempZipFile = new File(filePath + "_todelete");
+              if (tempZipFile.exists()) {
+                boolean deleteResult = tempZipFile.delete();
+
+                if (!deleteResult) {
+                  throw new Exception("File not deleted");
+                }
+              }
+              boolean renameResult = downloadedZipFile.renameTo(tempZipFile);
+              if (!renameResult) {
+                throw new Exception("File not renamed");
+              }
+              unzip(tempZipFile, downloadedZipFile);
+              boolean deleteResult = tempZipFile.delete();
+
+              if (!deleteResult) {
+                Log.d(getName(), "Temp zip file not deleted");
+              }
+
+              WritableMap params = Arguments.createMap();
+              params.putString("id", taskId);
+              ee.emit("downloadComplete", params);
+            } catch(Exception e) {
+              e.printStackTrace();
+
+              WritableMap params = Arguments.createMap();
+              params.putString("id", taskId);
+              params.putInt("errorcode", -1);
+              ee.emit("downloadFailed", params);
+            }
+          }
+        }).start();
       }
 
       removeFromMaps(download.getId());
@@ -422,5 +467,40 @@ public class RNBackgroundDownloaderModule extends ReactContextBaseJavaModule imp
 
   @Override
   public void onStarted(Download download, List<? extends DownloadBlock> list, int i) {
+  }
+
+  private void unzip(File zipFile, File targetDirectory) throws IOException {
+    ZipInputStream zis = new ZipInputStream(new BufferedInputStream(new FileInputStream(zipFile)));
+
+    try {
+      ZipEntry ze;
+      int count;
+      byte[] buffer = new byte[8192];
+
+      while ((ze = zis.getNextEntry()) != null) {
+        File file = new File(targetDirectory, ze.getName());
+        File dir = ze.isDirectory() ? file : file.getParentFile();
+
+        if (!dir.isDirectory() && !dir.mkdirs()) {
+          throw new FileNotFoundException("Failed to ensure directory: " + dir.getAbsolutePath());
+        }
+
+        if (ze.isDirectory()) {
+          continue;
+        }
+
+        FileOutputStream fout = new FileOutputStream(file);
+
+        try {
+          while ((count = zis.read(buffer)) != -1) {
+            fout.write(buffer, 0, count);
+          }
+        } finally {
+          fout.close();
+        }
+      }
+    } finally {
+      zis.close();
+    }
   }
 }
